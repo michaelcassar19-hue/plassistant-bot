@@ -14,6 +14,7 @@ import logging
 import os
 from pathlib import Path
 import re
+import random
 import secrets
 import urllib.parse
 import urllib.request
@@ -2680,7 +2681,7 @@ def scrim_embed(record: dict[str, object]) -> discord.Embed:
                 f"Choose a role below. Signups close <t:{end_timestamp}:R>.\n"
                 f"Need **{SCRIM_REQUIRED_PLAYERS} players** and "
                 f"**{SCRIM_REQUIRED_GOALKEEPERS} goalkeepers** to start. "
-                "Signups stay open for the full 10 minutes."
+                "A moderator can generate lineups early with `/scrim code`."
             ),
             color=discord.Color.blurple(),
         )
@@ -2752,7 +2753,8 @@ def balanced_scrim_sides(
     def rating(user_id: str) -> int:
         return get_player_ovr(guild.id, user_id)
 
-    ordered = sorted(unique_ids, key=lambda user_id: (-rating(user_id), user_id))
+    random.shuffle(unique_ids)
+    ordered = sorted(unique_ids, key=lambda user_id: -rating(user_id))
     blue: list[str] = []
     red: list[str] = []
     blue_strength = 0
@@ -2780,9 +2782,10 @@ def balanced_scrim_sides(
             red.append(user_id)
             red_strength += member_rating
             tie_to_blue = True
-    if include_goalkeeper and len(unique_ids) >= 2:
+    if include_goalkeeper:
+        # Keep every signed-up goalkeeper; when only one joined, place them on blue.
         return blue[:1], red[:1]
-    return blue[:SCRIM_REQUIRED_PLAYERS // 2], red[:SCRIM_REQUIRED_PLAYERS // 2]
+    return blue, red
 
 
 def build_scrim_lineup(guild: discord.Guild, record: dict[str, object]) -> dict[str, object]:
@@ -2840,7 +2843,15 @@ async def notify_scrim_organizer(
         lineup = record.get("lineup", {})
         if not isinstance(lineup, dict):
             lineup = {}
-        lines = ["Scrim concluded with enough signups. Here are the balanced teams:"]
+        players = record.get("players", [])
+        goalkeepers = record.get("goalkeepers", [])
+        player_count = len(set(str(x) for x in players)) if isinstance(players, list) else 0
+        keeper_count = len(set(str(x) for x in goalkeepers)) if isinstance(goalkeepers, list) else 0
+        lines = [
+            "Here are the randomized, balanced scrim lineups:",
+            f"Signups: {player_count} player(s), {keeper_count} goalkeeper(s). "
+            "Lineups are generated even when the roster is incomplete."
+        ]
         for color in ("blue", "red"):
             side = lineup.get(color, {})
             if not isinstance(side, dict):
@@ -2854,7 +2865,10 @@ async def notify_scrim_organizer(
             if not isinstance(player_ovrs, dict):
                 player_ovrs = {}
             lines.append(f"\n**{color.title()} team**")
-            lines.append(f"Goalkeeper: {scrim_display_name(guild, keeper_id)} · OVR {keeper_ovr}")
+            if keeper_id:
+                lines.append(f"Goalkeeper: {scrim_display_name(guild, keeper_id)} · OVR {keeper_ovr}")
+            else:
+                lines.append("Goalkeeper: Not signed up")
             lines.extend(
                 f"Player: {scrim_display_name(guild, str(user_id))} · "
                 f"OVR {player_ovrs.get(str(user_id), DEFAULT_PLAYER_OVR)}"
@@ -2877,12 +2891,9 @@ async def conclude_scrim_signup(guild_id: str, scrim_id: str) -> str | None:
         LOGGER.warning("Could not find guild %s to conclude scrim %s", guild_id, scrim_id)
         return None
 
-    if scrim_has_required_roster(record):
-        record["outcome"] = "ready"
-        record["lineup"] = build_scrim_lineup(guild, record)
-    else:
-        record["outcome"] = "failed"
-        record.pop("lineup", None)
+    # Always produce the best possible lineup, even with a small roster.
+    record["outcome"] = "ready"
+    record["lineup"] = build_scrim_lineup(guild, record)
     record["status"] = "concluded"
     record["completed_at"] = int(discord.utils.utcnow().timestamp())
     save_league_state()
@@ -3075,10 +3086,15 @@ async def scrim_start(interaction: discord.Interaction) -> None:
     await interaction.response.defer(ephemeral=True)
     message: discord.Message | None = None
     try:
+        scrim_role = discord.utils.find(
+            lambda role: role.name.casefold() in {"scrim player", "scrim players"},
+            interaction.guild.roles,
+        )
         message = await interaction.channel.send(
+            content=scrim_role.mention if scrim_role is not None else None,
             embed=scrim_embed(record),
             view=ScrimSignupView(str(record["id"])),
-            allowed_mentions=discord.AllowedMentions.none(),
+            allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False),
         )
         record["message_id"] = str(message.id)
         saved_scrims.append(record)
@@ -3155,13 +3171,74 @@ async def scrim_code(interaction: discord.Interaction, code: str) -> None:
             ephemeral=True,
         )
         return
-    await interaction.response.send_message(
-        f"Scrim code: `{code}`",
+    # Defer first because generating a lineup also updates the signup post and DMs the organizer.
+    await interaction.response.defer()
+    # Staff/owner can force the active scrim lineup immediately while sharing the code.
+    member = interaction.user if isinstance(interaction.user, discord.Member) else None
+    is_staff = bool(
+        member
+        and (
+            member.id == interaction.guild.owner_id
+            or member.guild_permissions.administrator
+            or member.guild_permissions.manage_guild
+        )
+    )
+    generated = False
+    if is_staff:
+        scrims = get_guild_data(interaction.guild.id)["scrims"]
+        active = next(
+            (
+                item for item in reversed(scrims)
+                if isinstance(item, dict) and item.get("status") == "open"
+            ),
+            None,
+        ) if isinstance(scrims, list) else None
+        if active is not None:
+            outcome = await conclude_scrim_signup(str(interaction.guild.id), str(active.get("id", "")))
+            task = scrim_expiration_tasks.pop(str(active.get("id", "")), None)
+            if task is not None and task is not asyncio.current_task():
+                task.cancel()
+            generated = outcome is not None
+    message = f"Scrim code: `{code}`"
+    if generated:
+        message += "\nLineups generated immediately by staff; the 10-minute timer was skipped."
+    await interaction.followup.send(
+        message,
         allowed_mentions=discord.AllowedMentions.none(),
     )
 
 
 bot.tree.add_command(scrim_group)
+
+
+@bot.tree.command(name="announce", description="Announce a message in the channel where this command is used")
+@app_commands.describe(message="The announcement to post in this channel")
+async def announce(interaction: discord.Interaction, message: str) -> None:
+    if interaction.guild is None or not isinstance(interaction.channel, discord.TextChannel):
+        await interaction.response.send_message("Use this command in a server text channel.", ephemeral=True)
+        return
+    member = interaction.user if isinstance(interaction.user, discord.Member) else None
+    if member is None or not (
+        member.id == interaction.guild.owner_id
+        or member.guild_permissions.administrator
+        or member.guild_permissions.manage_guild
+        or member.guild_permissions.manage_messages
+    ):
+        await interaction.response.send_message(
+            "Only moderators, administrators, or the server owner can make announcements.",
+            ephemeral=True,
+        )
+        return
+    message = message.strip()
+    if not message or len(message) > 2000:
+        await interaction.response.send_message("Enter an announcement between 1 and 2000 characters.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    await interaction.channel.send(
+        f"📢 **Announcement**\n{message}",
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+    await interaction.followup.send("Announcement posted in this channel.", ephemeral=True)
 
 
 @bot.tree.command(name="fixtures", description="Create or post fixtures with supporter reactions")
