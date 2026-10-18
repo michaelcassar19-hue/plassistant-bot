@@ -106,14 +106,30 @@ class LeagueModBot(commands.Bot):
             except ValueError as error:
                 raise RuntimeError("DISCORD_GUILD_ID must be a numeric server ID") from error
 
+            # Guild-scoped commands update almost immediately, unlike global commands.
+            # This avoids long periods where Discord's client shows an old command schema.
             self.tree.copy_global_to(guild=guild)
             synced = await self.tree.sync(guild=guild)
-            LOGGER.info("Synced %d slash commands to server %s", len(synced), guild_id)
+            LOGGER.info(
+                "Synced %d guild slash commands to server %s: %s",
+                len(synced), guild_id, ", ".join(command.name for command in synced),
+            )
+
+            # Optional cleanup for single-server deployments: set this to true only if
+            # these commands should no longer be published globally in any server.
+            if os.getenv("DISCORD_CLEAR_GLOBAL_COMMANDS", "").strip().lower() in {"1", "true", "yes"}:
+                self.tree.clear_commands(guild=None)
+                cleared = await self.tree.sync()
+                LOGGER.warning(
+                    "Cleared global application commands (remaining global commands: %d).",
+                    len(cleared),
+                )
             return
 
         synced = await self.tree.sync()
         LOGGER.info(
-            "Synced %d global slash commands. Global propagation can take up to an hour.",
+            "Synced %d global slash commands. Discord may take up to an hour to refresh global command listings; "
+            "set DISCORD_GUILD_ID to enable near-immediate updates in one server.",
             len(synced),
         )
 
@@ -4426,8 +4442,10 @@ async def on_app_command_error(
             interaction.guild_id,
         )
         message = (
-            "Discord sent an outdated command entry. Close and reopen the slash-command menu, "
-            "then choose the command again. Global command updates can take up to an hour."
+            "Discord sent an old slash-command entry that this bot version no longer recognizes. "
+            "This is usually caused by cached/global command registration, not the command's permissions. "
+            "Reopen Discord's command picker. For reliable immediate updates, set DISCORD_GUILD_ID "
+            "to this server's ID and restart the bot; global command updates can take up to an hour."
         )
     elif isinstance(error, app_commands.errors.CheckFailure):
         message = "This command can only be used inside a server."
