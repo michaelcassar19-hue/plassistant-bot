@@ -1,0 +1,1 @@
+"""League moderation bot package."""
