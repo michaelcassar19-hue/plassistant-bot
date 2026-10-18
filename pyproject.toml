@@ -1,0 +1,9 @@
+[project]
+name = "repl-nix-workspace"
+version = "0.1.0"
+description = "League moderation bot for Discord"
+requires-python = ">=3.13"
+dependencies = [
+    "discord-py>=2.7.1",
+    "pillow>=12.3.0",
+]
